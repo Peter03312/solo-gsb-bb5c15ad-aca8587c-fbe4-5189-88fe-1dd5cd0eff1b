@@ -17,7 +17,7 @@ from .db import (
     publish_closures,
     publish_graph,
 )
-from .routing import NoRouteError, build_engine
+from .routing import NoRouteError, Stop, build_engine
 from .schemas import ValidationError as PayloadValidationError
 from .timeutil import format_time
 
@@ -37,21 +37,43 @@ def _segment_to_dict(seg) -> dict:
     }
 
 
-def _route_to_dict(route) -> dict:
+def _stop_to_dict(visit) -> dict:
     return {
+        "node": visit.node,
+        "arrival_time": format_time(visit.arrival_time),
+        "arrival_time_epoch": visit.arrival_time,
+        "start_time": format_time(visit.start_time),
+        "start_time_epoch": visit.start_time,
+        "end_time": format_time(visit.end_time),
+        "end_time_epoch": visit.end_time,
+        "stay_seconds": visit.stay_seconds,
+        "wait_for_window_seconds": visit.start_time - visit.arrival_time,
+    }
+
+
+def _route_to_dict(route) -> dict:
+    total_stay = sum(v.stay_seconds for v in route.stops)
+    result = {
         "origin": route.origin,
         "destination": route.destination,
         "query_departure_time": format_time(route.departure_time),
         "query_departure_time_epoch": route.departure_time,
         "arrival_time": format_time(route.arrival_time),
         "arrival_time_epoch": route.arrival_time,
+        # 等候 = 非通行、非停留时间（封闭等候 + 等窗口开放）
         "total_waiting_seconds": route.arrival_time
         - route.departure_time
-        - sum(s.travel_seconds for s in route.segments),
+        - sum(s.travel_seconds for s in route.segments)
+        - total_stay,
         "avoid_stairs": route.avoid_stairs,
         "edge_sequence": [s.edge_id for s in route.segments],
         "segments": [_segment_to_dict(s) for s in route.segments],
     }
+    if route.stops:
+        # 仅带停靠查询才返回停靠明细，无停靠时保持原有返回结构
+        result["stops"] = [_stop_to_dict(v) for v in route.stops]
+        result["total_stay_seconds"] = total_stay
+    return result
 
 
 def _maybe_seed(conn) -> None:
@@ -150,12 +172,17 @@ async def query_route(request: Request):
 
         query = normalize_query(payload, snap.node_set)
         engine = build_engine(snap)
+        stops = tuple(
+            Stop(s["node"], s["earliest"], s["latest"], s["stay"])
+            for s in query["stops"]
+        )
         try:
             route = engine.plan(
                 origin=query["origin"],
                 destination=query["destination"],
                 departure=query["departure"],
                 avoid_stairs=query["avoid_stairs"],
+                stops=stops,
             )
         except NoRouteError as exc:
             return JSONResponse(

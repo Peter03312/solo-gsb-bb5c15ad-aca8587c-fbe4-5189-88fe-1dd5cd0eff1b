@@ -2,7 +2,8 @@
 
 面向园区访客的**离线**通行规划 HTTP 服务。导入一张带方向、通行秒数、台阶标记的
 步道图，以及按**半开时间区间** `[start, end)` 生效的封闭记录；给定起终点、出发
-时刻与是否避台阶，返回**最早到达**路线及逐段的进入、离开时间。
+时刻与是否避台阶，返回**最早到达**路线及逐段的进入、离开时间。支持在查询中
+指定**按顺序停靠的站点**（每站带开始停留时间窗与停留秒数），见第 4.1 节。
 
 - 语言/存储：Python 3.11 + SQLite（标准库，无需外部数据库）
 - Web 框架：FastAPI + Uvicorn
@@ -148,9 +149,91 @@ python -m app.cli serve
 
 | 场景 | 状态码 | `error` |
 | --- | --- | --- |
-| 起终点未知、时间格式错误等 | `400` | `invalid_payload` |
-| 无可行路线（含避台阶后不可达） | `404` | `no_route` |
+| 起终点未知、时间格式错误、停靠点参数非法等 | `400` | `invalid_payload` |
+| 无可行路线（含避台阶后不可达、任一停靠站无法按时停留） | `404` | `no_route` |
 | 尚未导入步道图 | `503` | `no_data` |
+
+### 4.1 按顺序停靠（`stops`，可选）
+
+查询可携带 `stops` 数组，访客将**按给定顺序**完成各站停靠：
+
+```json
+{
+  "origin": "GATE",
+  "destination": "TOWER",
+  "departure_time": "2026-10-05T08:50:00Z",
+  "avoid_stairs": false,
+  "stops": [
+    {
+      "node": "LAKE",
+      "earliest_start": "2026-10-05T09:00:00Z",
+      "latest_start": "2026-10-05T09:10:00Z",
+      "stay_seconds": 300
+    }
+  ]
+}
+```
+
+每站字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `node` | 停靠地点（必须是已知节点） |
+| `earliest_start` | 最早开始停留时刻（ISO 8601 或纪元秒） |
+| `latest_start` | 最晚开始停留时刻，须 `>= earliest_start`（闭区间） |
+| `stay_seconds` | 停留秒数，**非负整数**（`0` 表示即停即走） |
+
+语义规则：
+
+- 抵达某站后可在节点**等到窗口开放**，开始停留时刻为
+  `max(抵达时刻, earliest_start)`，且**不得晚于 `latest_start`**，
+  否则本次查询无路线（`404 no_route`）；
+- **结束停留后才能前往下一站**；途经尚未轮到的站点（包括未来各站所在
+  节点）**不算完成停靠**，只当作普通节点通过；
+- 起点本身就是第 1 站、或相邻两站位于同一节点时，立即（链式）完成停靠；
+- 选路目标不变：**最终到达**（完成全部停靠并抵达终点）最早优先，平局按
+  **全程**路段编号序列字典序选取，不逐段独立打破平局；
+- 封闭区间（半开）、避台阶、单次查询固定数据版本的规则对每一程同样生效。
+
+带停靠时响应在原有结构基础上增加 `stops` 明细与 `total_stay_seconds`
+（无停靠点时不出现这两个字段，返回结构与之前完全一致）：
+
+```json
+{
+  "arrival_time": "2026-10-05T09:09:00Z",
+  "total_waiting_seconds": 120,
+  "total_stay_seconds": 300,
+  "edge_sequence": ["E1", "E3", "E5"],
+  "segments": ["... 全程逐段（跨各程拼接） ..."],
+  "stops": [
+    {
+      "node": "LAKE",
+      "arrival_time": "2026-10-05T08:58:00Z",
+      "start_time": "2026-10-05T09:00:00Z",
+      "end_time": "2026-10-05T09:05:00Z",
+      "stay_seconds": 300,
+      "wait_for_window_seconds": 120
+    }
+  ],
+  "data_version": 2
+}
+```
+
+- `stops[i]` 给出第 `i+1` 站的**抵达**、**开始停留**、**结束停留**时刻
+  （均附 `_epoch` 秒级副本）与等窗秒数；
+- `total_waiting_seconds` 为非通行、非停留的等候总秒数（封闭等候 + 等窗）；
+- `segments` 覆盖**全程**（各程拼接），`waiting_seconds` 仍为进入该路段前
+  在节点的封闭等候。
+
+错误映射：
+
+| 场景 | 状态码 | `error` |
+| --- | --- | --- |
+| 时间窗无效（`earliest_start > latest_start`、时间格式错误） | `400` | `invalid_payload` |
+| `stay_seconds` 非非负整数（负数、小数、布尔、字符串） | `400` | `invalid_payload` |
+| 停靠地点未知 | `400` | `invalid_payload` |
+| 任一站无法按时停留（抵达已晚于 `latest_start`） | `404` | `no_route` |
+| 某站或终点不可达 | `404` | `no_route` |
 
 ### `POST /admin/graph` — 原子发布新步道图
 
@@ -202,6 +285,29 @@ curl -s -X POST http://localhost:8080/api/route \
   -d '{"origin":"HILL","destination":"TOWER",
        "departure_time":"2026-10-05T09:59:00Z","avoid_stairs":false}'
 
+# 按顺序停靠：08:50 出发，LAKE 站 09:00–09:10 之间开始停留、停留 300 秒
+curl -s -X POST http://localhost:8080/api/route \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"GATE","destination":"TOWER",
+       "departure_time":"2026-10-05T08:50:00Z",
+       "stops":[{"node":"LAKE",
+                 "earliest_start":"2026-10-05T09:00:00Z",
+                 "latest_start":"2026-10-05T09:10:00Z",
+                 "stay_seconds":300}]}'
+# 结果要点：E1(08:50→08:53) → E3(08:53→08:58) 抵 LAKE；
+#   等窗 120 秒，09:00 开始停留，09:05 结束；E5(09:05→09:09)；
+#   arrival_time=2026-10-05T09:09:00Z，stops[0] 记录 08:58/09:00/09:05。
+
+# 停靠窗口不可行：最晚 08:55 开始，但最早 08:58 才到 LAKE → 404 no_route
+curl -s -X POST http://localhost:8080/api/route \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"GATE","destination":"TOWER",
+       "departure_time":"2026-10-05T08:50:00Z",
+       "stops":[{"node":"LAKE",
+                 "earliest_start":"2026-10-05T08:00:00Z",
+                 "latest_start":"2026-10-05T08:55:00Z",
+                 "stay_seconds":60}]}'
+
 # 冒烟自检（需服务已启动）
 python3 scripts/smoke_test.py http://localhost:8080
 ```
@@ -230,13 +336,18 @@ print(route["arrival_time"], route["edge_sequence"])
 
 ## 6. 选路与版本语义
 
-- **选路目标**：① 最早到达；② 到达时刻相同时，按**路段编号序列字典序**选路
-  （字符串逐元素比较，例如 `("E1","E3") < ("E2","E4")`）。
+- **选路目标**：① 最早到达（带停靠时为完成全部停靠并抵达终点的时刻）；
+  ② 到达时刻相同时，按**全程路段编号序列字典序**选路（字符串逐元素比较，
+  例如 `("E1","E3") < ("E2","E4")`），不逐段独立打破平局。
 - **算法**：
-  1. 时间依赖的 Dijkstra（FIFO 网络）计算各节点最早到达时刻 `T`；
-  2. 在“到达终点不晚于 `T`”的状态空间做多标签搜索，取 `(到达时刻, 编号序列)`
-     最优者。第二阶段用于处理“节点等候把不同路径的到达时刻拉平”后，单标号
-     算法可能选错字典序路径的问题。
+  1. 时间依赖的 Dijkstra（FIFO 网络）计算最早到达时刻 `T`（带停靠时逐程
+     复合：各程最早到达映射与“停留结束时刻”均为单调非降，逐程取最早即
+     全局最早，同时校验各站窗口可行）；
+  2. 在“最终到达不晚于 `T`”的状态空间做多标签搜索，取 `(到达时刻, 编号序列)`
+     最优者。无停靠时状态为节点；带停靠时状态为 `(节点, 已完成停靠数)`，
+     抵达当前轮到的站点即完成停靠（等窗 + 停留），途经未来站点不产生停靠。
+     第二阶段用于处理“节点等候/停靠窗口把不同路径的到达时刻拉平”后，
+     单标号算法可能选错字典序路径的问题。
 - **原子发布与版本一致**：
   - 每次导入（图或封闭）在一个 SQLite 写事务中完成全部校验、复制与版本指针切换，
     失败整体回滚；
@@ -252,15 +363,15 @@ print(route["arrival_time"], route["edge_sequence"])
 app/
   config.py        # 环境变量配置
   timeutil.py      # ISO 8601 <-> 纪元秒（UTC）
-  schemas.py       # 导入/查询负载校验
+  schemas.py       # 导入/查询负载校验（含停靠点 stops）
   db.py            # SQLite 版本化与原子发布
-  routing.py       # 时间依赖最短路 + 字典序选路引擎
+  routing.py       # 时间依赖最短路 + 字典序选路引擎（含按顺序停靠）
   main.py          # FastAPI 路由
   sample_data.py   # 内置示例数据
   cli.py           # init-db / import-* / serve
 data/              # 示例 JSON 与本地数据库
 scripts/smoke_test.py
-tests/             # 标准库 unittest 测试（34 个用例）
+tests/             # 标准库 unittest 测试（63 个用例）
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh
@@ -273,4 +384,5 @@ python3 -m unittest discover -s tests -v
 ```
 
 测试覆盖半开区间边界、节点等候、封闭穿越判定、方向、避台阶、字典序平局、
+按顺序停靠（窗口等待、顺序约束、全程字典序、起点/终点即站点）、
 无路线、原子发布回滚与版本快照等场景。

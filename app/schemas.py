@@ -150,6 +150,52 @@ def normalize_closures(payload: Any, known_edges: set[str]) -> list[dict]:
     return closures
 
 
+def _normalize_stop(raw: Any, index: int, node_set: set[str]) -> dict:
+    """校验一个按顺序停靠点。
+
+    期望格式::
+
+        {"node": "PLAZA",
+         "earliest_start": "2026-10-05T10:00:00Z",
+         "latest_start":   "2026-10-05T10:30:00Z",
+         "stay_seconds": 600}
+
+    时间窗为闭区间 ``[earliest_start, latest_start]``：开始停留不得早于
+    ``earliest_start``、不得晚于 ``latest_start``；``stay_seconds`` 为
+    非负整数秒。
+    """
+    where = f"stops[{index}]"
+    if not isinstance(raw, dict):
+        raise ValidationError(f"{where} 必须是对象")
+    for field in ("node", "earliest_start", "latest_start", "stay_seconds"):
+        if field not in raw:
+            raise ValidationError(f"{where} 缺少必填字段: {field}")
+
+    node = _clean_identifier(raw.get("node"), f"{where}.node")
+    if node not in node_set:
+        raise ValidationError(f"{where} 引用了未知节点: {node!r}")
+
+    try:
+        earliest = parse_time(raw["earliest_start"])
+        latest = parse_time(raw["latest_start"])
+    except TimeError as exc:
+        raise ValidationError(f"{where}: {exc}") from None
+    if earliest > latest:
+        raise ValidationError(
+            f"{where} 无效时间窗: earliest_start({raw['earliest_start']}) "
+            f"必须不晚于 latest_start({raw['latest_start']})"
+        )
+
+    stay = raw["stay_seconds"]
+    # 严格类型：拒绝 bool、float、数字字符串等隐式转换
+    if isinstance(stay, bool) or not isinstance(stay, int):
+        raise ValidationError(f"{where}.stay_seconds 必须是非负整数")
+    if stay < 0:
+        raise ValidationError(f"{where}.stay_seconds 必须是非负整数，收到 {stay}")
+
+    return {"node": node, "earliest": earliest, "latest": latest, "stay": stay}
+
+
 def normalize_query(payload: Any, node_set: set[str]) -> dict:
     """校验一次路线查询负载。"""
     data = _require_object(payload, "查询")
@@ -172,9 +218,15 @@ def normalize_query(payload: Any, node_set: set[str]) -> dict:
     if not isinstance(avoid_stairs, bool):
         raise ValidationError("avoid_stairs 必须是布尔值 true/false")
 
+    raw_stops = data.get("stops", [])
+    if not isinstance(raw_stops, list):
+        raise ValidationError("stops 必须是数组")
+    stops = [_normalize_stop(raw, i, node_set) for i, raw in enumerate(raw_stops)]
+
     return {
         "origin": origin,
         "destination": destination,
         "departure": departure,
         "avoid_stairs": avoid_stairs,
+        "stops": stops,
     }

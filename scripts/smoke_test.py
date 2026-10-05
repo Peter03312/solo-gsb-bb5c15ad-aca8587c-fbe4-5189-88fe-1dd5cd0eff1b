@@ -46,6 +46,7 @@ def main() -> int:
         "avoid_stairs": False,
     })
     assert status == 200, route
+    assert "stops" not in route, route  # 无停靠点时保持原有返回结构
     print("普通查询:", route["edge_sequence"], "->", route["arrival_time"])
 
     # 2. 避台阶：只能走 E1 E3 E5
@@ -89,6 +90,55 @@ def main() -> int:
                       "start": "2026-10-05T10:00:00Z",
                       "end": "2026-10-05T09:00:00Z"}],
     }, expect_status=400)
+
+    # 7. 按顺序停靠：LAKE 窗口 [09:00,09:10] 停留 300s
+    #    08:50 出发 → 08:58 抵 LAKE，等窗至 09:00，09:05 离开，09:09 到 TOWER
+    status, route_stop = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:50:00Z",
+        "stops": [{"node": "LAKE",
+                   "earliest_start": "2026-10-05T09:00:00Z",
+                   "latest_start": "2026-10-05T09:10:00Z",
+                   "stay_seconds": 300}],
+    })
+    assert route_stop["edge_sequence"] == ["E1", "E3", "E5"], route_stop
+    assert route_stop["arrival_time"] == "2026-10-05T09:09:00Z", route_stop
+    (visit,) = route_stop["stops"]
+    assert (visit["arrival_time"], visit["start_time"], visit["end_time"]) == (
+        "2026-10-05T08:58:00Z", "2026-10-05T09:00:00Z", "2026-10-05T09:05:00Z"), visit
+    assert route_stop["total_stay_seconds"] == 300, route_stop
+    print("停靠查询:", visit["node"], visit["start_time"], "->", route_stop["arrival_time"])
+
+    # 8. 停靠窗口不可行（最晚 08:55 早于抵达 08:58）→ 404 no_route
+    status, nr = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:50:00Z",
+        "stops": [{"node": "LAKE",
+                   "earliest_start": "2026-10-05T08:00:00Z",
+                   "latest_start": "2026-10-05T08:55:00Z",
+                   "stay_seconds": 60}],
+    }, expect_status=404)
+    assert nr["error"] == "no_route", nr
+
+    # 9. 停留秒数非法 / 停靠地点未知 → 400 invalid_payload
+    status, bad4 = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:50:00Z",
+        "stops": [{"node": "LAKE",
+                   "earliest_start": "2026-10-05T09:00:00Z",
+                   "latest_start": "2026-10-05T09:10:00Z",
+                   "stay_seconds": -1}],
+    }, expect_status=400)
+    assert bad4["error"] == "invalid_payload", bad4
+    status, bad5 = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:50:00Z",
+        "stops": [{"node": "GHOST",
+                   "earliest_start": "2026-10-05T09:00:00Z",
+                   "latest_start": "2026-10-05T09:10:00Z",
+                   "stay_seconds": 60}],
+    }, expect_status=400)
+    assert bad5["error"] == "invalid_payload", bad5
 
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)

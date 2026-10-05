@@ -28,6 +28,23 @@
 中间节点上“时刻更优”的路径，续接同一条后缀后可能与另一条路径同时
 到达终点，而路段编号序列反而更大。故字典序平局判定必须在第二阶段
 对完整序列进行。
+
+按顺序停靠
+==========
+查询可携带一组**按顺序**完成的停靠点，每站给出开始停留的闭区间
+``[earliest, latest]`` 与非负整数停留秒数：
+
+- 抵达某站后可在节点等到窗口开放，开始停留不得晚于 ``latest``，
+  结束停留后才能前往下一站；
+- 途经尚未轮到的站点（包括未来各站的节点）不算完成停靠，该节点
+  此时只当作普通节点通过；
+- 起点本身就是第 1 站、或相邻两站位于同一节点时，立即（链式）完成停靠。
+
+选路目标不变：**最终到达**（完成全部停靠并抵达终点）最早优先，平局
+按**全程**路段编号序列字典序选取——不得逐段独立打破平局。停靠窗口
+的“拉平”效应（晚到但在窗口下界前到达，结束停留时刻相同）意味着
+逐段最优拼接不等于全程最优，因此第二阶段在 ``(节点, 已完成停靠数)``
+状态空间上做多标签搜索，标签仍为 ``(时刻, 全程编号序列)``。
 """
 from __future__ import annotations
 
@@ -63,9 +80,29 @@ class Route(NamedTuple):
     origin: str
     destination: str
     departure_time: int      # 用户请求的出发时刻
-    arrival_time: int        # 最早到达时刻
+    arrival_time: int        # 最早到达时刻（完成全部停靠并抵达终点）
     avoid_stairs: bool
     segments: tuple[Segment, ...]
+    stops: tuple["StopVisit", ...] = ()   # 各停靠点的抵达/开始/结束记录
+
+
+class Stop(NamedTuple):
+    """一个按顺序停靠点（查询输入，时刻为纪元秒）。"""
+
+    node: str
+    earliest: int   # 最早开始停留时刻（闭区间下界）
+    latest: int     # 最晚开始停留时刻（闭区间上界）
+    stay: int       # 停留秒数（非负整数）
+
+
+class StopVisit(NamedTuple):
+    """一个停靠点的实际停靠记录。"""
+
+    node: str
+    arrival_time: int   # 抵达该站时刻
+    start_time: int     # 实际开始停留时刻（max(抵达, 窗口下界)）
+    end_time: int       # 结束停留时刻（start + stay_seconds）
+    stay_seconds: int
 
 
 class NoRouteError(Exception):
@@ -219,7 +256,11 @@ class RouteEngine:
         destination: str,
         departure: int,
         avoid_stairs: bool = False,
+        stops: tuple[Stop, ...] = (),
     ) -> Route:
+        if stops:
+            return self._plan_with_stops(origin, destination, departure, avoid_stairs, stops)
+
         dist = self._earliest_arrival_map(origin, departure, avoid_stairs)
         if destination not in dist:
             raise NoRouteError(
@@ -260,6 +301,187 @@ class RouteEngine:
             arrival_time=deadline,
             avoid_stairs=avoid_stairs,
             segments=tuple(segments),
+        )
+
+    # ------------------------------------------------------------------
+    # 按顺序停靠：窗口应用与两阶段选路
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _stays_at(node: str, k: int, clock: int, stops: tuple[Stop, ...]):
+        """在 ``node`` 上链式完成所有“当前轮到且地点即 node”的停靠。
+
+        返回 ``(k', clock', visits)``；若某站无法按窗口停留则返回
+        ``(k, clock, None)`` 表示该走法不可行。
+        """
+        visits: list[StopVisit] = []
+        while k < len(stops) and stops[k].node == node:
+            stop = stops[k]
+            start = max(clock, stop.earliest)
+            if start > stop.latest:
+                return k, clock, None
+            end = start + stop.stay
+            visits.append(StopVisit(node, clock, start, end, stop.stay))
+            clock = end
+            k += 1
+        return k, clock, visits
+
+    def _earliest_final_with_stops(
+        self,
+        origin: str,
+        destination: str,
+        departure: int,
+        avoid_stairs: bool,
+        stops: tuple[Stop, ...],
+    ) -> int:
+        """第一阶段：完成全部停靠并抵达终点的最早时刻。
+
+        各腿的最早到达映射与“停留结束时刻”都是关于出发时刻的单调
+        非降函数，其复合亦然，故逐腿取最早到达即得全局最早最终到达；
+        同时最早到达时若窗口已关，则更晚到达也不可能满足窗口。
+        """
+        suffix = "（已避开台阶路段）" if avoid_stairs else ""
+        clock = departure
+        current = origin
+        k = 0
+        while True:
+            # 当前节点即下一停靠点时立即（链式）完成停靠
+            k, clock, visits = self._stays_at(current, k, clock, stops)
+            if visits is None:
+                raise NoRouteError(
+                    f"第 {k + 1} 站（{stops[k].node}）无法按时停留："
+                    f"开始停留不得晚于该站最晚时刻"
+                )
+            if k >= len(stops):
+                break
+            stop = stops[k]
+            dist = self._earliest_arrival_map(current, clock, avoid_stairs)
+            if stop.node not in dist:
+                raise NoRouteError(f"无法到达第 {k + 1} 站（{stop.node}）{suffix}")
+            clock = dist[stop.node]
+            current = stop.node
+        if current != destination:
+            dist = self._earliest_arrival_map(current, clock, avoid_stairs)
+            if destination not in dist:
+                raise NoRouteError(
+                    "在当前步道图与封闭记录下不存在可行路线" + suffix
+                )
+            clock = dist[destination]
+        return clock
+
+    def _lex_smallest_with_stops(
+        self,
+        origin: str,
+        destination: str,
+        departure: int,
+        avoid_stairs: bool,
+        stops: tuple[Stop, ...],
+        deadline: int,
+    ) -> tuple[str, ...]:
+        """在“最终到达不晚于 deadline”的走法中取全程编号序列字典序最小者。
+
+        状态为 ``(节点, 已完成停靠数)``；抵达当前轮到的站点即强制完成
+        停靠（可链式），途经未来站点不产生停靠。支配规则与单段情形相同，
+        因为同一状态下任意共同后缀的窗口/封闭行为一致。
+        """
+        k0, t0, visits0 = self._stays_at(origin, 0, departure, stops)
+        if visits0 is None:
+            raise NoRouteError("第 1 站即起点，但出发时刻已错过其最晚开始停留时刻")
+
+        labels: dict[tuple[str, int], list[tuple[int, tuple[str, ...]]]] = defaultdict(list)
+        labels[(origin, k0)].append((t0, ()))
+        heap: list[tuple[int, tuple[str, ...], str, int]] = [(t0, (), origin, k0)]
+
+        while heap:
+            t, seq, u, k = heapq.heappop(heap)
+            if (t, seq) not in labels.get((u, k), ()):
+                continue  # 已被支配后移除的过期标签
+
+            for edge in self._neighbors(u, avoid_stairs):
+                enter = self.earliest_departure(edge, t)
+                leave = enter + edge.seconds
+                if leave > deadline:
+                    continue  # 不可能参与“最早到达”的路线
+                nk, nt = k, leave
+                if nk < len(stops) and stops[nk].node == edge.dst:
+                    nk, nt, visits = self._stays_at(edge.dst, nk, leave, stops)
+                    if visits is None or nt > deadline:
+                        continue  # 窗口不可行或注定超过最早到达
+                new_seq = seq + (edge.id,)
+                new_label = (nt, new_seq)
+
+                state = (edge.dst, nk)
+                existing = labels[state]
+                if any(self._dominates(et, es, nt, new_seq) for et, es in existing):
+                    continue
+                labels[state] = [
+                    (et, es) for et, es in existing
+                    if not self._dominates(nt, new_seq, et, es)
+                ]
+                labels[state].append(new_label)
+                heapq.heappush(heap, (nt, new_seq, edge.dst, nk))
+
+        best = min(
+            labels.get((destination, len(stops)), ()),
+            default=None,
+            key=lambda item: (item[0], item[1]),
+        )
+        if best is None:
+            raise NoRouteError("内部错误：最早到达已知，但字典序选路失败")
+        return best[1]
+
+    def _plan_with_stops(
+        self,
+        origin: str,
+        destination: str,
+        departure: int,
+        avoid_stairs: bool,
+        stops: tuple[Stop, ...],
+    ) -> Route:
+        deadline = self._earliest_final_with_stops(
+            origin, destination, departure, avoid_stairs, stops
+        )
+        best_seq = self._lex_smallest_with_stops(
+            origin, destination, departure, avoid_stairs, stops, deadline
+        )
+
+        # 按获胜序列重放，生成逐段时间与各站停靠记录
+        segments: list[Segment] = []
+        visits: list[StopVisit] = []
+        current = origin
+        clock = departure
+        k = 0
+        k, clock, v0 = self._stays_at(origin, k, clock, stops)
+        visits.extend(v0)
+        for edge_id in best_seq:
+            edge = self._edges[edge_id]
+            enter = self.earliest_departure(edge, clock)
+            leave = enter + edge.seconds
+            segments.append(
+                Segment(
+                    edge_id=edge.id,
+                    from_node=current,
+                    to_node=edge.dst,
+                    enter_time=enter,
+                    leave_time=leave,
+                    travel_seconds=edge.seconds,
+                    waiting_seconds=enter - clock,
+                    has_stairs=edge.has_stairs,
+                )
+            )
+            clock = leave
+            current = edge.dst
+            if k < len(stops) and stops[k].node == current:
+                k, clock, vk = self._stays_at(current, k, clock, stops)
+                visits.extend(vk)
+
+        return Route(
+            origin=origin,
+            destination=destination,
+            departure_time=departure,
+            arrival_time=deadline,
+            avoid_stairs=avoid_stairs,
+            segments=tuple(segments),
+            stops=tuple(visits),
         )
 
 
