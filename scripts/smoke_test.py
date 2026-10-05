@@ -90,6 +90,58 @@ def main() -> int:
                       "end": "2026-10-05T09:00:00Z"}],
     }, expect_status=400)
 
+    # 7. 按顺序停靠：GATE 08:00 出发，PLAZA 窗口 [09:00,09:30] 停留 300s
+    status, stopped = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:00:00Z",
+        "avoid_stairs": False,
+        "stops": [{
+            "node": "PLAZA",
+            "earliest_start": "2026-10-05T09:00:00Z",
+            "latest_start": "2026-10-05T09:30:00Z",
+            "dwell_seconds": 300,
+        }],
+    })
+    assert status == 200, stopped
+    stop0 = stopped["stops"][0]
+    assert stop0["node"] == "PLAZA", stop0
+    assert stop0["start_time"] == "2026-10-05T09:00:00Z", stop0
+    assert stop0["end_time"] == "2026-10-05T09:05:00Z", stop0
+    print("停靠查询:", stopped["edge_sequence"], "->", stopped["arrival_time"],
+          "停靠:", [(s["node"], s["start_time"], s["end_time"]) for s in stopped["stops"]])
+
+    # 8. 停靠点时间窗无法满足（最早抵达晚于最晚开始）→ 404 no_route
+    status, no_route = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:00:00Z",
+        "stops": [{
+            "node": "TOWER",
+            "earliest_start": "2026-10-05T08:00:00Z",
+            "latest_start": "2026-10-05T08:01:00Z",
+            "dwell_seconds": 0,
+        }],
+    }, expect_status=404)
+    assert no_route["error"] == "no_route", no_route
+
+    # 9. 非法停留秒数 / 无效时间窗 / 未知停靠地点 → 400 invalid_payload
+    for bad_stop in (
+        {"node": "GHOST",
+         "earliest_start": "2026-10-05T09:00:00Z",
+         "latest_start": "2026-10-05T09:30:00Z", "dwell_seconds": 0},
+        {"node": "PLAZA",
+         "earliest_start": "2026-10-05T09:30:00Z",
+         "latest_start": "2026-10-05T09:00:00Z", "dwell_seconds": 0},
+        {"node": "PLAZA",
+         "earliest_start": "2026-10-05T09:00:00Z",
+         "latest_start": "2026-10-05T09:30:00Z", "dwell_seconds": -5},
+    ):
+        status, err = call("POST", "/api/route", {
+            "origin": "GATE", "destination": "TOWER",
+            "departure_time": "2026-10-05T08:00:00Z",
+            "stops": [bad_stop],
+        }, expect_status=400)
+        assert err["error"] == "invalid_payload", err
+
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
         return 1

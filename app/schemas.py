@@ -150,8 +150,70 @@ def normalize_closures(payload: Any, known_edges: set[str]) -> list[dict]:
     return closures
 
 
+def _validate_non_negative_seconds(value: Any, field: str) -> int:
+    # 与通行秒数一致的严格类型：拒绝 bool、float、数字字符串
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"{field}必须是非负整数")
+    if value < 0:
+        raise ValidationError(f"{field}不能为负数，收到 {value}")
+    return value
+
+
+def _normalize_stop(raw: Any, index: int, node_set: set[str]) -> dict:
+    """校验单个按顺序停靠点。
+
+    期望格式::
+
+        {"node": "PLAZA",
+         "earliest_start": "2026-10-05T10:00:00Z",
+         "latest_start":   "2026-10-05T10:10:00Z",
+         "dwell_seconds": 120}
+
+    时间窗为封闭区间，两端都允许开始停留，故要求
+    ``earliest_start <= latest_start``；``dwell_seconds`` 为非负整数，
+    允许 0（时刻打卡式停靠）。
+    """
+    where = f"stops[{index}]"
+    if not isinstance(raw, dict):
+        raise ValidationError(f"{where} 必须是对象")
+    for field in ("node", "earliest_start", "latest_start", "dwell_seconds"):
+        if field not in raw:
+            raise ValidationError(f"{where} 缺少 {field}")
+
+    node = _clean_identifier(raw.get("node"), f"{where}.node")
+    if node not in node_set:
+        raise ValidationError(f"{where}.node 引用了未知节点: {node!r}")
+
+    try:
+        earliest = parse_time(raw["earliest_start"])
+    except TimeError as exc:
+        raise ValidationError(f"{where}.earliest_start: {exc}") from None
+    try:
+        latest = parse_time(raw["latest_start"])
+    except TimeError as exc:
+        raise ValidationError(f"{where}.latest_start: {exc}") from None
+    if earliest > latest:
+        raise ValidationError(
+            f"{where} 无效时间窗: earliest_start({raw['earliest_start']}) "
+            f"不得晚于 latest_start({raw['latest_start']})"
+        )
+
+    dwell = _validate_non_negative_seconds(raw["dwell_seconds"], f"{where}.dwell_seconds")
+    return {
+        "node": node,
+        "earliest_start": earliest,
+        "latest_start": latest,
+        "dwell_seconds": dwell,
+    }
+
+
 def normalize_query(payload: Any, node_set: set[str]) -> dict:
-    """校验一次路线查询负载。"""
+    """校验一次路线查询负载。
+
+    可选字段 ``stops`` 为按顺序停靠的站点数组（缺省/为空时沿用原有
+    查询语义），每项含 ``node``、``earliest_start``、``latest_start``、
+    ``dwell_seconds``。
+    """
     data = _require_object(payload, "查询")
     for field in ("origin", "destination", "departure_time"):
         if field not in data:
@@ -172,9 +234,17 @@ def normalize_query(payload: Any, node_set: set[str]) -> dict:
     if not isinstance(avoid_stairs, bool):
         raise ValidationError("avoid_stairs 必须是布尔值 true/false")
 
+    raw_stops = data.get("stops", [])
+    if raw_stops is None:
+        raw_stops = []
+    if not isinstance(raw_stops, list):
+        raise ValidationError("stops 必须是数组")
+    stops = [_normalize_stop(raw, i, node_set) for i, raw in enumerate(raw_stops)]
+
     return {
         "origin": origin,
         "destination": destination,
         "departure": departure,
         "avoid_stairs": avoid_stairs,
+        "stops": stops,
     }

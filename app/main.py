@@ -37,21 +37,44 @@ def _segment_to_dict(seg) -> dict:
     }
 
 
-def _route_to_dict(route) -> dict:
+def _stop_to_dict(stop) -> dict:
     return {
+        "index": stop.index,
+        "node": stop.node,
+        "arrival_time": format_time(stop.arrival_time),
+        "arrival_time_epoch": stop.arrival_time,
+        "start_time": format_time(stop.start_time),
+        "start_time_epoch": stop.start_time,
+        "end_time": format_time(stop.end_time),
+        "end_time_epoch": stop.end_time,
+        "earliest_start": format_time(stop.earliest_start),
+        "latest_start": format_time(stop.latest_start),
+        "dwell_seconds": stop.dwell_seconds,
+        "waiting_seconds": stop.waiting_seconds,
+    }
+
+
+def _route_to_dict(route) -> dict:
+    result = {
         "origin": route.origin,
         "destination": route.destination,
         "query_departure_time": format_time(route.departure_time),
         "query_departure_time_epoch": route.departure_time,
         "arrival_time": format_time(route.arrival_time),
         "arrival_time_epoch": route.arrival_time,
+        # 等候秒数只统计路段进入前因封闭/窗口产生的等待，不含站点停留时间
         "total_waiting_seconds": route.arrival_time
         - route.departure_time
-        - sum(s.travel_seconds for s in route.segments),
+        - sum(s.travel_seconds for s in route.segments)
+        - sum(s.dwell_seconds for s in route.stops),
         "avoid_stairs": route.avoid_stairs,
         "edge_sequence": [s.edge_id for s in route.segments],
         "segments": [_segment_to_dict(s) for s in route.segments],
     }
+    # 无停靠点时沿用原有返回结构；有停靠点时才增加 stops 字段
+    if route.stops:
+        result["stops"] = [_stop_to_dict(s) for s in route.stops]
+    return result
 
 
 def _maybe_seed(conn) -> None:
@@ -146,6 +169,7 @@ async def query_route(request: Request):
                 content={"error": "no_data", "detail": "尚未导入步道图，请先调用导入接口"},
             )
 
+        from .routing import Stop
         from .schemas import normalize_query
 
         query = normalize_query(payload, snap.node_set)
@@ -156,6 +180,15 @@ async def query_route(request: Request):
                 destination=query["destination"],
                 departure=query["departure"],
                 avoid_stairs=query["avoid_stairs"],
+                stops=[
+                    Stop(
+                        node=s["node"],
+                        earliest_start=s["earliest_start"],
+                        latest_start=s["latest_start"],
+                        dwell_seconds=s["dwell_seconds"],
+                    )
+                    for s in query["stops"]
+                ],
             )
         except NoRouteError as exc:
             return JSONResponse(
